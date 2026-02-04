@@ -1,7 +1,8 @@
 // utils/ethiotelecomReceipt.js
 "use strict";
 
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-core");
+const chromium = require("@sparticuz/chromium");
 const cheerio = require("cheerio");
 
 // Browser instance (reused for performance)
@@ -27,6 +28,8 @@ const ERROR_CODES = {
   PARSE_FAIL: "Failed to parse receipt data. Required fields are missing.",
   NAVIGATION_ERROR: "Navigation error occurred while loading the page.",
   UNKNOWN_ERROR: "An unexpected error occurred.",
+  TX_EXTRACT_FAILED: "Could not extract transaction code from URL.",
+  HTTP_ERROR: "HTTP error occurred while fetching the receipt.",
 };
 
 /**
@@ -38,28 +41,39 @@ async function getBrowser() {
   }
 
   try {
+    console.log("Launching browser...");
+    
+    const executablePath = await chromium.executablePath();
+    console.log("Chromium executable path:", executablePath);
+
     browserInstance = await puppeteer.launch({
-      headless: "new",
       args: [
+        ...chromium.args,
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-accelerated-2d-canvas",
         "--disable-gpu",
         "--window-size=1920x1080",
-        "--disable-web-security",
-        "--disable-features=VizDisplayCompositor",
+        "--single-process",
+        "--no-zygote",
       ],
-      timeout: 30000,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: executablePath,
+      headless: chromium.headless,
+      timeout: 60000,
     });
 
     // Handle browser disconnection
     browserInstance.on("disconnected", () => {
+      console.log("Browser disconnected");
       browserInstance = null;
     });
 
+    console.log("Browser launched successfully");
     return browserInstance;
   } catch (error) {
+    console.error("Browser launch error:", error);
     const err = new Error(ERROR_CODES.BROWSER_LAUNCH_FAILED);
     err.code = "BROWSER_LAUNCH_FAILED";
     err.originalError = error.message;
@@ -74,6 +88,7 @@ async function closeBrowser() {
   if (browserInstance) {
     try {
       await browserInstance.close();
+      console.log("Browser closed");
     } catch (e) {
       console.error("Error closing browser:", e.message);
     }
@@ -95,16 +110,16 @@ function extractTxFromUrl(url) {
   try {
     const urlObj = new URL(url);
     const pathParts = urlObj.pathname.split("/").filter(Boolean);
-    
+
     // Expected format: /receipt/{tx}
     if (pathParts.length >= 2 && pathParts[0] === "receipt") {
       return pathParts[1];
     }
-    
+
     // Try query parameter
     const txParam = urlObj.searchParams.get("tx") || urlObj.searchParams.get("id");
     if (txParam) return txParam;
-    
+
     // Return last path segment as fallback
     return pathParts[pathParts.length - 1] || null;
   } catch (e) {
@@ -163,10 +178,10 @@ function normalizeKey(s) {
 function parseEthiopianName(fullName) {
   const cleaned = cleanText(fullName);
   if (!cleaned) return null;
-  
+
   const parts = cleaned.split(" ").filter(Boolean);
   const [first, father, grandfather, ...rest] = parts;
-  
+
   return {
     full: parts.join(" "),
     first: first || null,
@@ -324,7 +339,7 @@ function extractCanonical(html, tx) {
 /**
  * Fetch receipt using Puppeteer
  */
-async function fetchReceiptWithPuppeteer(url, timeoutMs = 30000) {
+async function fetchReceiptWithPuppeteer(url, timeoutMs = 60000) {
   const browser = await getBrowser();
   let page = null;
 
@@ -340,15 +355,14 @@ async function fetchReceiptWithPuppeteer(url, timeoutMs = 30000) {
     // Set extra headers
     await page.setExtraHTTPHeaders({
       "Accept-Language": "en-US,en;q=0.9",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     });
 
-    // Enable request interception for better error handling
+    // Enable request interception
     await page.setRequestInterception(true);
-    
+
     let requestError = null;
-    
+
     page.on("request", (request) => {
       request.continue();
     });
@@ -356,6 +370,8 @@ async function fetchReceiptWithPuppeteer(url, timeoutMs = 30000) {
     page.on("requestfailed", (request) => {
       requestError = request.failure()?.errorText || "Request failed";
     });
+
+    console.log(`Navigating to: ${url}`);
 
     // Navigate to URL
     const response = await page.goto(url, {
@@ -371,6 +387,8 @@ async function fetchReceiptWithPuppeteer(url, timeoutMs = 30000) {
     }
 
     const status = response.status();
+    console.log(`Response status: ${status}`);
+
     if (status >= 400) {
       const err = new Error(`HTTP Error: ${status}`);
       err.code = "HTTP_ERROR";
@@ -378,14 +396,12 @@ async function fetchReceiptWithPuppeteer(url, timeoutMs = 30000) {
       throw err;
     }
 
-    // Wait for content to load
-    await page.waitForSelector("body", { timeout: 5000 });
+    // Wait for content
+    await page.waitForSelector("body", { timeout: 10000 });
 
     // Get page content
     const html = await page.content();
-
-    // Take screenshot for debugging (optional)
-    // const screenshot = await page.screenshot({ encoding: 'base64' });
+    console.log(`Got HTML content, length: ${html.length}`);
 
     return {
       html,
@@ -393,13 +409,15 @@ async function fetchReceiptWithPuppeteer(url, timeoutMs = 30000) {
       url: page.url(),
     };
   } catch (error) {
+    console.error("Fetch error:", error.message);
+
     if (error.name === "TimeoutError") {
       const err = new Error(ERROR_CODES.PAGE_TIMEOUT);
       err.code = "PAGE_TIMEOUT";
       err.originalError = error.message;
       throw err;
     }
-    
+
     if (error.code) throw error;
 
     const err = new Error(ERROR_CODES.NAVIGATION_ERROR);
@@ -421,6 +439,8 @@ async function fetchReceiptWithPuppeteer(url, timeoutMs = 30000) {
  * Get receipt canonical data from transaction code
  */
 async function getReceiptCanonical(tx) {
+  console.log(`Getting receipt for tx: ${tx}`);
+
   // Validate transaction code format
   if (!/^[A-Za-z0-9]{10}$/.test(tx)) {
     const err = new Error(ERROR_CODES.TX_FORMAT);
@@ -431,7 +451,7 @@ async function getReceiptCanonical(tx) {
   const receiptUrl = buildReceiptUrlFromTx(tx);
   assertAllowedHost(receiptUrl);
 
-  const timeoutMs = Number(process.env.RECEIPT_FETCH_TIMEOUT_MS || 30000);
+  const timeoutMs = Number(process.env.RECEIPT_FETCH_TIMEOUT_MS || 60000);
 
   const { html, url: finalUrl } = await fetchReceiptWithPuppeteer(
     receiptUrl,
@@ -480,18 +500,15 @@ async function getReceiptCanonical(tx) {
  * Get receipt from full URL
  */
 async function getReceiptFromUrl(url) {
-  // Validate URL
   assertAllowedHost(url);
 
-  // Extract transaction code
   const tx = extractTxFromUrl(url);
   if (!tx) {
-    const err = new Error("Could not extract transaction code from URL");
+    const err = new Error(ERROR_CODES.TX_EXTRACT_FAILED);
     err.code = "TX_EXTRACT_FAILED";
     throw err;
   }
 
-  // Validate transaction code
   if (!/^[A-Za-z0-9]{10}$/.test(tx)) {
     const err = new Error(ERROR_CODES.TX_FORMAT);
     err.code = "TX_FORMAT";
@@ -502,15 +519,15 @@ async function getReceiptFromUrl(url) {
   return getReceiptCanonical(tx);
 }
 
-// Graceful shutdown
+// Graceful shutdown handlers
 process.on("SIGINT", async () => {
-  console.log("Closing browser...");
+  console.log("SIGINT received. Closing browser...");
   await closeBrowser();
   process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
-  console.log("Closing browser...");
+  console.log("SIGTERM received. Closing browser...");
   await closeBrowser();
   process.exit(0);
 });

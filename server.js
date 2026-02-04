@@ -29,22 +29,45 @@ app.use((req, res, next) => {
   next();
 });
 
-// Request logging middleware
+// Request logging
 app.use((req, res, next) => {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${req.method} ${req.path}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
 
 /**
- * API: Check receipt by URL
+ * Get HTTP status code for error
+ */
+function getStatusCodeForError(code) {
+  const map = {
+    TX_FORMAT: 400,
+    INVALID_URL: 400,
+    HOST_NOT_ALLOWED: 403,
+    INVALID_PROTOCOL: 400,
+    TX_NOT_FOUND: 404,
+    MISSING_INPUT: 400,
+    TX_EXTRACT_FAILED: 400,
+    HTTP_ERROR: 502,
+    PAGE_TIMEOUT: 504,
+    BROWSER_LAUNCH_FAILED: 503,
+    PAGE_LOAD_FAILED: 502,
+    NAVIGATION_ERROR: 502,
+    EMPTY_HTML: 502,
+    PARSE_FAIL: 422,
+  };
+  return map[code] || 500;
+}
+
+/**
+ * API: Check receipt by URL or transaction code
  */
 app.post("/api/check-receipt", async (req, res) => {
   const startTime = Date.now();
   const { url, transactionCode } = req.body;
 
+  console.log("Request body:", { url, transactionCode });
+
   try {
-    // Validate input
     if (!url && !transactionCode) {
       return res.status(400).json({
         success: false,
@@ -58,17 +81,14 @@ app.post("/api/check-receipt", async (req, res) => {
     let result;
 
     if (transactionCode) {
-      // Use transaction code directly
       console.log(`Processing transaction code: ${transactionCode}`);
       result = await getReceiptCanonical(transactionCode.trim());
     } else {
-      // Extract from URL
       console.log(`Processing URL: ${url}`);
       result = await getReceiptFromUrl(url.trim());
     }
 
     const processingTime = Date.now() - startTime;
-
     console.log(`Success! Processing time: ${processingTime}ms`);
 
     res.json({
@@ -81,16 +101,16 @@ app.post("/api/check-receipt", async (req, res) => {
     });
   } catch (error) {
     const processingTime = Date.now() - startTime;
-    
     console.error(`Error: ${error.code || "UNKNOWN"} - ${error.message}`);
-    
+    if (error.stack) console.error("Stack:", error.stack);
+
     const errorResponse = {
       success: false,
       error: {
         code: error.code || "UNKNOWN_ERROR",
         message: ERROR_CODES[error.code] || error.message || "An unexpected error occurred",
         details: error.details || null,
-        originalError: process.env.NODE_ENV === "development" ? error.originalError : undefined,
+        originalError: error.originalError || null,
       },
       meta: {
         processingTime: `${processingTime}ms`,
@@ -114,47 +134,32 @@ app.get("/api/receipt/:txCode", async (req, res) => {
     console.log(`Processing transaction code: ${txCode}`);
     const result = await getReceiptCanonical(txCode.trim());
 
-    const processingTime = Date.now() - startTime;
-
     res.json({
       success: true,
       data: result,
       meta: {
-        processingTime: `${processingTime}ms`,
+        processingTime: `${Date.now() - startTime}ms`,
         timestamp: new Date().toISOString(),
       },
     });
   } catch (error) {
     const processingTime = Date.now() - startTime;
-    
     console.error(`Error: ${error.code || "UNKNOWN"} - ${error.message}`);
 
-    const errorResponse = {
+    res.status(getStatusCodeForError(error.code)).json({
       success: false,
       error: {
         code: error.code || "UNKNOWN_ERROR",
         message: ERROR_CODES[error.code] || error.message,
         details: error.details || null,
+        originalError: error.originalError || null,
       },
       meta: {
         processingTime: `${processingTime}ms`,
         timestamp: new Date().toISOString(),
       },
-    };
-
-    const statusCode = getStatusCodeForError(error.code);
-    res.status(statusCode).json(errorResponse);
+    });
   }
-});
-
-/**
- * API: Get error codes reference
- */
-app.get("/api/error-codes", (req, res) => {
-  res.json({
-    success: true,
-    data: ERROR_CODES,
-  });
 });
 
 /**
@@ -165,6 +170,17 @@ app.get("/api/health", (req, res) => {
     success: true,
     status: "healthy",
     timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || "development",
+  });
+});
+
+/**
+ * API: Get all error codes
+ */
+app.get("/api/error-codes", (req, res) => {
+  res.json({
+    success: true,
+    data: ERROR_CODES,
   });
 });
 
@@ -202,49 +218,28 @@ app.use((err, req, res, next) => {
   });
 });
 
-/**
- * Get HTTP status code for error
- */
-function getStatusCodeForError(errorCode) {
-  const statusMap = {
-    TX_FORMAT: 400,
-    INVALID_URL: 400,
-    HOST_NOT_ALLOWED: 403,
-    INVALID_PROTOCOL: 400,
-    TX_NOT_FOUND: 404,
-    MISSING_INPUT: 400,
-    TX_EXTRACT_FAILED: 400,
-    HTTP_ERROR: 502,
-    PAGE_TIMEOUT: 504,
-    BROWSER_LAUNCH_FAILED: 503,
-    PAGE_LOAD_FAILED: 502,
-    NAVIGATION_ERROR: 502,
-    EMPTY_HTML: 502,
-    PARSE_FAIL: 422,
-  };
-  return statusMap[errorCode] || 500;
-}
-
 // Start server
 const server = app.listen(PORT, () => {
   console.log(`
-╔══════════════════════════════════════════════════════════╗
-║     Ethio Telecom Receipt Verification Server            ║
-╠══════════════════════════════════════════════════════════╣
-║  Server running on: http://localhost:${PORT}                 ║
-║  API Endpoints:                                          ║
-║    POST /api/check-receipt - Check receipt by URL/code   ║
-║    GET  /api/receipt/:txCode - Get receipt by code       ║
-║    GET  /api/health - Health check                       ║
-║    GET  /api/error-codes - List all error codes          ║
-╚══════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════╗
+║     Ethio Telecom Receipt Verification Server             ║
+╠═══════════════════════════════════════════════════════════╣
+║  Server running on: http://localhost:${PORT}                  ║
+║  Environment: ${(process.env.NODE_ENV || "development").padEnd(42)}║
+║                                                           ║
+║  API Endpoints:                                           ║
+║    POST /api/check-receipt - Check by URL or code         ║
+║    GET  /api/receipt/:txCode - Get receipt by code        ║
+║    GET  /api/health - Health check                        ║
+║    GET  /api/error-codes - List all error codes           ║
+╚═══════════════════════════════════════════════════════════╝
   `);
 });
 
 // Graceful shutdown
 async function gracefulShutdown(signal) {
-  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
-  
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+
   server.close(async () => {
     console.log("HTTP server closed.");
     await closeBrowser();
